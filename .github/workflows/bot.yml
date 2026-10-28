@@ -2,7 +2,7 @@ name: Gold Signal Bot 24/7
 
 on:
   schedule:
-    - cron: '*/15 * * * *' # Runs every 15 minutes automatically
+    - cron: '*/15 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -23,16 +23,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Bot Script
+      - name: Run Gold Trading Bot
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python main.py
+        run: |
+          python main.py
 
-      - name: Save Memory State
+      - name: Commit and Push Updated State
         run: |
           git config --global user.name "GitHub Action Bot"
-          git config --global user.email "bot@github.com"
-          git add state.json || true
-          git commit -m "Update Bot State & Memory" || true
-          git push || true
+          git config --global user.email "action@github.com"
+          git add state.json
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update state.json" && git push)
