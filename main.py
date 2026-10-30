@@ -7,7 +7,7 @@ from datetime import datetime
 import pytz
 
 # --- CONFIGURATION ---
-SYMBOL = "GC=F"  # Gold Futures
+SYMBOL = "GC=F"  # Gold Futures (XAU/USD)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 STATE_FILE = "state.json"
@@ -15,11 +15,11 @@ PKT = pytz.timezone('Asia/Karachi')
 
 def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown", "disable_web_page_preview": True}
     try:
-        requests.post(url, json=payload)
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        print(f"Error sending message: {e}")
+        print(f"Telegram Error: {e}")
 
 def load_state():
     today = datetime.now(PKT).strftime('%Y-%m-%d')
@@ -29,7 +29,7 @@ def load_state():
         "daily_wins": 0,
         "daily_losses": 0,
         "bot_locked": False,
-        "active_trade": None
+        "last_signal_time": ""
     }
     if os.path.exists(STATE_FILE):
         try:
@@ -46,132 +46,123 @@ def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=4)
 
-def get_clean_data(symbol, interval, period):
-    df = yf.download(tickers=symbol, interval=interval, period=period, progress=False)
-    if df.empty:
-        return None
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    df.dropna(inplace=True)
-    return df
+def fetch_market_data():
+    df_m15 = yf.download(SYMBOL, interval="15m", period="5d", progress=False)
+    df_h4 = yf.download(SYMBOL, interval="4h", period="20d", progress=False)
+    
+    if df_m15.empty or df_h4.empty:
+        return None, None
+        
+    if isinstance(df_m15.columns, pd.MultiIndex):
+        df_m15.columns = df_m15.columns.get_level_values(0)
+    if isinstance(df_h4.columns, pd.MultiIndex):
+        df_h4.columns = df_h4.columns.get_level_values(0)
+        
+    df_m15.dropna(inplace=True)
+    df_h4.dropna(inplace=True)
+    return df_m15, df_h4
 
 def run_bot():
     now_pkt = datetime.now(PKT)
-    print(f"[{now_pkt.strftime('%Y-%m-%d %H:%M:%S PKT')}] Fetching Market Data...")
+    print(f"[{now_pkt.strftime('%Y-%m-%d %H:%M:%S PKT')}] Scanning Gold Market...")
 
     state = load_state()
 
     # Rule: Max 3 trades per day & Stop on 2 Losses
     if state.get("bot_locked", False):
-        print("Bot is locked for today due to 2 losses. No trading.")
+        print("Bot is locked for today due to 2 losses.")
         return
     if state.get("daily_trades", 0) >= 3:
-        print("Maximum daily limit (3 trades) reached for today.")
+        print("Maximum daily limit (3 trades) reached.")
         return
 
-    # 1. Fetch Data
-    df_m15 = get_clean_data(SYMBOL, "15m", "5d")
-    df_h4 = get_clean_data(SYMBOL, "4h", "20d")
-
+    df_m15, df_h4 = fetch_market_data()
     if df_m15 is None or df_h4 is None or len(df_m15) < 30:
-        print("Insufficient market data. Retrying next cycle.")
+        print("Market data fetching issue. Will try next run.")
         return
 
-    # 2. H4 Trend Filter (Native Pandas 50 EMA)
+    # 1. H4 Trend Identification (50 EMA)
     df_h4['ema50'] = df_h4['Close'].ewm(span=50, adjust=False).mean()
-    h4_last_close = df_h4['Close'].iloc[-1]
-    h4_ema = df_h4['ema50'].iloc[-1]
-    
-    if pd.isna(h4_ema):
-        print("H4 EMA calculation pending...")
+    h4_trend = "BULLISH" if df_h4['Close'].iloc[-1] > df_h4['ema50'].iloc[-1] else "BEARISH"
+
+    # 2. M15 SMC & Engulfing Logic
+    lookback = 12
+    recent_sw_low = df_m15['Low'].iloc[-lookback:-1].min()
+    recent_sw_high = df_m15['High'].iloc[-lookback:-1].max()
+
+    curr = df_m15.iloc[-1]
+    prev = df_m15.iloc[-2]
+
+    curr_candle_time = str(df_m15.index[-1])
+    if state.get("last_signal_time") == curr_candle_time:
+        print("Already processed signal for this candle.")
         return
-
-    h4_trend = "BULLISH" if h4_last_close > h4_ema else "BEARISH"
-
-    # 3. M15 ATR Calculation (Native Pandas)
-    tr1 = df_m15['High'] - df_m15['Low']
-    tr2 = (df_m15['High'] - df_m15['Close'].shift(1)).abs()
-    tr3 = (df_m15['Low'] - df_m15['Close'].shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    df_m15['atr'] = tr.rolling(window=14).mean()
-    
-    # Swings Calculation
-    lookback = 15
-    recent_lows = df_m15['Low'].iloc[-lookback:-2]
-    recent_highs = df_m15['High'].iloc[-lookback:-2]
-    
-    swing_low = recent_lows.min()
-    swing_high = recent_highs.max()
-
-    curr_candle = df_m15.iloc[-1]
-    prev_candle = df_m15.iloc[-2]
-    c15_open = curr_candle['Open']
-    c15_close = curr_candle['Close']
-    c15_high = curr_candle['High']
-    c15_low = curr_candle['Low']
-    current_atr = df_m15['atr'].iloc[-1]
 
     signal = None
-    entry_price = 0.0
+    entry_price = float(curr['Close'])
     sl_price = 0.0
     tp_price = 0.0
 
-    # --- SMC STRATEGY LOGIC ---
-    # BULLISH SETUP: H4 Bullish + Liquidity Sweep + Body CHoCH + FVG Retest
+    # --- BUY SETUP (Tight SL & 1:2 TP) ---
     if h4_trend == "BULLISH":
-        liquidity_swept = prev_candle['Low'] < swing_low or c15_low < swing_low
-        body_choch = c15_close > swing_high and c15_close > c15_open
+        liquidity_swept = (prev['Low'] < recent_sw_low) or (curr['Low'] < recent_sw_low)
+        bullish_engulfing = (curr['Close'] > curr['Open']) and (curr['Close'] > prev['High'])
         
-        c1_high = df_m15['High'].iloc[-3]
-        c3_low = df_m15['Low'].iloc[-1]
-        has_fvg = c3_low > c1_high
-        
-        if liquidity_swept and body_choch and has_fvg:
-            fvg_50 = c1_high + ((c3_low - c1_high) * 0.5)
-            if c15_low <= fvg_50 or c15_close <= fvg_50:
-                signal = "BUY"
-                entry_price = c15_close
-                sl_distance = max((entry_price - c15_low) + 1.5, current_atr * 1.5)
-                sl_price = entry_price - sl_distance
-                tp_price = entry_price + (sl_distance * 2)
+        if liquidity_swept and bullish_engulfing:
+            signal = "BUY"
+            # Tight SL: Lowest point of sweep - $1.50 buffer
+            sl_raw = min(curr['Low'], prev['Low']) - 1.50
+            # Cap maximum SL at $4.00
+            if (entry_price - sl_raw) > 4.0:
+                sl_price = entry_price - 3.50
+            else:
+                sl_price = sl_raw
+            
+            sl_distance = entry_price - sl_price
+            tp_price = entry_price + (sl_distance * 2.0)  # 1:2 RR
 
-    # BEARISH SETUP: H4 Bearish + Liquidity Sweep + Body CHoCH + FVG Retest
+    # --- SELL SETUP (Tight SL & 1:2 TP) ---
     elif h4_trend == "BEARISH":
-        liquidity_swept = prev_candle['High'] > swing_high or c15_high > swing_high
-        body_choch = c15_close < swing_low and c15_close < c15_open
+        liquidity_swept = (prev['High'] > recent_sw_high) or (curr['High'] > recent_sw_high)
+        bearish_engulfing = (curr['Close'] < curr['Open']) and (curr['Close'] < prev['Low'])
         
-        c1_low = df_m15['Low'].iloc[-3]
-        c3_high = df_m15['High'].iloc[-1]
-        has_fvg = c1_low > c3_high
-        
-        if liquidity_swept and body_choch and has_fvg:
-            fvg_50 = c3_high + ((c1_low - c3_high) * 0.5)
-            if c15_high >= fvg_50 or c15_close >= fvg_50:
-                signal = "SELL"
-                entry_price = c15_close
-                sl_distance = max((c15_high - entry_price) + 1.5, current_atr * 1.5)
-                sl_price = entry_price + sl_distance
-                tp_price = entry_price - (sl_distance * 2)
+        if liquidity_swept and bearish_engulfing:
+            signal = "SELL"
+            # Tight SL: Highest point of sweep + $1.50 buffer
+            sl_raw = max(curr['High'], prev['High']) + 1.50
+            # Cap maximum SL at $4.00
+            if (sl_raw - entry_price) > 4.0:
+                sl_price = entry_price + 3.50
+            else:
+                sl_price = sl_raw
+                
+            sl_distance = sl_price - entry_price
+            tp_price = entry_price - (sl_distance * 2.0)  # 1:2 RR
 
-    # --- SEND TELEGRAM SIGNAL ---
+    # --- TRIGGER TELEGRAM SIGNAL ---
     if signal:
-        state["daily_trades"] = state.get("daily_trades", 0) + 1
+        state["daily_trades"] += 1
+        state["last_signal_time"] = curr_candle_time
         save_state(state)
 
+        risk_pts = abs(entry_price - sl_price)
+        reward_pts = abs(tp_price - entry_price)
+
         msg = (
-            f"⚡ *GOLD {signal} SIGNAL (SMC Setup)* ⚡\n\n"
-            f"📍 *Entry Price:* {entry_price:.2f}\n"
-            f"🛑 *Stop Loss:* {sl_price:.2f}\n"
-            f"🎯 *Take Profit:* {tp_price:.2f}\n\n"
-            f"📊 *Trend (H4):* {h4_trend}\n"
-            f"⚖️ *Risk:Reward:* 1:2\n"
-            f"🕒 *Time:* {now_pkt.strftime('%H:%M PKT')}\n"
-            f"📌 *Daily Trade:* {state['daily_trades']}/3"
+            f"🔔 *NEW GOLD {signal} SIGNAL* 🔔\n\n"
+            f"📍 *Entry:* `{entry_price:.2f}`\n"
+            f"🛑 *Stop Loss:* `{sl_price:.2f}` ({risk_pts:.1f} pts)\n"
+            f"🎯 *Take Profit:* `{tp_price:.2f}` ({reward_pts:.1f} pts)\n\n"
+            f"📊 *H4 Trend:* {h4_trend}\n"
+            f"⚖️ *Risk:Reward:* 1:2 Target\n"
+            f"🕒 *Time:* {now_pkt.strftime('%I:%M %p PKT')}\n"
+            f"📌 *Daily Signal Count:* {state['daily_trades']}/3\n\n"
+            f"🔗 [Open TradingView Gold Chart](https://www.tradingview.com/chart/?symbol=OANDA:XAUUSD)"
         )
         send_telegram_message(msg)
-        print(f"Signal generated and sent to Telegram: {signal}")
+        print(f"SUCCESS: {signal} signal sent to Telegram!")
     else:
-        print("Market scanned successfully: No Liquidity Sweep + FVG setup right now.")
+        print("Scan finished: No high-probability setup on this 15M candle.")
 
 if __name__ == "__main__":
     run_bot()
