@@ -1,1 +1,8 @@
-{}
+{
+    "date": "2026-11-10",
+    "daily_trades": 1,
+    "daily_wins": 0,
+    "daily_losses": 0,
+    "bot_locked": false,
+    "last_signal_time": "2026-11-10 08:30:00-05:00"
+}
